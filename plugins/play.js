@@ -11,6 +11,45 @@ module.exports = {
     const chatId = context.chatId || message.key.remoteJid;
     const searchQuery = args.join(' ').trim();
 
+    // Helper function to wait
+    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Helper function for API calls with retry logic
+    const apiCallWithRetry = async (url, maxRetries = 3, baseDelay = 2000) => {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          // Add delay before each request to respect rate limits (1 second = 60 RPM max)
+          await wait(1000);
+          
+          const response = await axios.get(url, { 
+            timeout: 45000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0'
+            }
+          });
+          
+          return response;
+        } catch (error) {
+          const isRateLimited = error.response?.status === 429 || 
+                               error.code === 'ECONNABORTED' ||
+                               error.code === 'ETIMEDOUT';
+          
+          if (attempt === maxRetries) {
+            throw error;
+          }
+
+          if (isRateLimited) {
+            // Exponential backoff for rate limiting
+            const delay = baseDelay * Math.pow(2, attempt - 1);
+            console.log(`Rate limited or timeout. Retrying in ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
+            await wait(delay);
+          } else {
+            throw error;
+          }
+        }
+      }
+    };
+
     try {
       if (!searchQuery) {
         return await sock.sendMessage(chatId, {
@@ -22,59 +61,83 @@ module.exports = {
         text: "🔍 *Searching for your song...*"
       }, { quoted: message });
 
-      await new Promise(resolve => setTimeout(resolve, 10000));
-
-      const searchUrl = `https://discardapi.dpdns.org/api/search/spotify?apikey=guru&query=${encodeURIComponent(searchQuery)}`;
-      const searchResponse = await axios.get(searchUrl, { timeout: 30000 });
+      // Search for the song with retry logic
+      const searchUrl = `https://api.qasimdev.dpdns.org/api/spotify/search?apiKey=qasim-dev&query=${encodeURIComponent(searchQuery)}`;
+      const searchResponse = await apiCallWithRetry(searchUrl);
       
-      if (!searchResponse.data?.result?.result || searchResponse.data.result.result.length === 0) {
+      if (!searchResponse.data?.success || !searchResponse.data?.data?.tracks || searchResponse.data.data.tracks.length === 0) {
         return await sock.sendMessage(chatId, {
           text: "❌ *No songs found!*\nTry a different search term."
         }, { quoted: message });
       }
 
-      const topResult = searchResponse.data.result.result[0];
-      const songName = topResult.name;
-      const artistName = topResult.artists;
-      const spotifyLink = topResult.link;
+      const topResult = searchResponse.data.data.tracks[0];
+      const songTitle = topResult.title;
+      const spotifyUrl = topResult.url;
+      const duration = topResult.duration;
+      const popularity = topResult.popularity;
 
-      await new Promise(resolve => setTimeout(resolve, 10000));
+      await sock.sendMessage(chatId, {
+        text: `✅ *Found!*\n\n🎵 *Song:* ${songTitle}\n⏱️ *Duration:* ${duration}\n📊 *Popularity:* ${popularity}\n\n⏳ *Downloading...*`
+      }, { quoted: message });
 
-      const downloadUrl = `https://discardapi.dpdns.org/api/dl/spotify?apikey=guru&url=${encodeURIComponent(spotifyLink)}`;
-      const downloadResponse = await axios.get(downloadUrl, { timeout: 60000 });
+      // Wait before making download request to respect rate limits
+      await wait(1500);
 
-      if (!downloadResponse.data?.result?.result?.download_url) {
+      // Download the song with retry logic
+      const downloadUrl = `https://api.qasimdev.dpdns.org/api/spotify/download?apiKey=qasim-dev&url=${encodeURIComponent(spotifyUrl)}`;
+      const downloadResponse = await apiCallWithRetry(downloadUrl, 3, 3000);
+
+      if (!downloadResponse.data?.success || !downloadResponse.data?.data?.download) {
         return await sock.sendMessage(chatId, {
           text: "❌ *Download failed!*\nThe API couldn't fetch the audio. Try again later."
         }, { quoted: message });
       }
 
-      const songData = downloadResponse.data.result.result;
-      const audioUrl = songData.download_url;
+      const songData = downloadResponse.data.data;
+      const audioUrl = songData.download;
       const title = songData.title;
-      const albumImage = songData.albumImage;
-      const duration = songData.duration;
-      const year = songData.year;
+      const artist = songData.artist;
+      const coverImage = songData.cover;
+      const durationMs = songData.duration;
+      
+      // Convert duration from milliseconds to mm:ss format
+      const minutes = Math.floor(durationMs / 60000);
+      const seconds = Math.floor((durationMs % 60000) / 1000);
+      const formattedDuration = `${minutes}:${seconds.toString().padStart(2, '0')}`;
 
+      // Fetch cover image as buffer
+      let thumbnailBuffer = null;
+      if (coverImage) {
+        try {
+          await wait(1000); // Respect rate limits
+          const imgResponse = await axios.get(coverImage, { 
+            responseType: 'arraybuffer',
+            timeout: 30000 
+          });
+          thumbnailBuffer = Buffer.from(imgResponse.data);
+        } catch (imgError) {
+          console.error('Failed to fetch cover image:', imgError.message);
+        }
+      }
+
+      // Send audio file
       await sock.sendMessage(chatId, {
         audio: { url: audioUrl },
         mimetype: "audio/mpeg",
-        fileName: `${title} - ${artistName}.mp3`,
+        fileName: `${title} - ${artist}.mp3`,
         contextInfo: {
           externalAdReply: {
             title: title,
-            body: `${artistName} • ${duration} • ${year}`,
-            thumbnail: albumImage ? await axios.get(albumImage, { responseType: 'arraybuffer' }).then(res => Buffer.from(res.data)) : null,
+            body: `${artist} • ${formattedDuration}`,
+            thumbnail: thumbnailBuffer,
             mediaType: 2,
-            mediaUrl: spotifyLink,
-            sourceUrl: spotifyLink
+            mediaUrl: spotifyUrl,
+            sourceUrl: spotifyUrl
           }
         }
       }, { quoted: message });
 
-      await sock.sendMessage(chatId, {
-        text: `✅ *Download Complete!*\n\n🎵 *Title:* ${title}\n👤 *Artist:* ${artistName}\n⏱️ *Duration:* ${duration}\n📅 *Year:* ${year}`
-      }, { quoted: message });
 
     } catch (error) {
       console.error('Play Command Error:', error);
@@ -83,13 +146,15 @@ module.exports = {
       
       if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
         errorMsg += "*Reason:* Connection timeout\nThe API took too long to respond.";
+      } else if (error.response?.status === 429) {
+        errorMsg += "*Reason:* Rate limit exceeded\nToo many requests. Please wait a minute and try again.";
       } else if (error.response) {
         errorMsg += `*Status:* ${error.response.status}\n*Error:* ${error.response.statusText}`;
       } else {
         errorMsg += `*Error:* ${error.message}`;
       }
       
-      errorMsg += "\n\nPlease try again later.";
+      errorMsg += "\n\n💡 *Tip:* Wait 10-15 seconds between requests to avoid rate limits.";
 
       await sock.sendMessage(chatId, {
         text: errorMsg
